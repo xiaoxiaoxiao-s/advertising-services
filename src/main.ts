@@ -5,6 +5,10 @@ import Koa from 'koa';
 import Router from '@koa/router';
 import { koaBody } from 'koa-body';
 import createError from 'http-errors';
+import {
+  generateAutoMaskPng,
+  type LogoMaskPreset,
+} from './services/logo-mask';
 import { processVideoWithWanx } from './services/video-edit';
 
 const app = new Koa();
@@ -14,6 +18,7 @@ app.use(async (ctx, next) => {
   try {
     await next();
   } catch (err: unknown) {
+    console.error(`[${ctx.method} ${ctx.path}]`, err);
     if (createError.isHttpError(err)) {
       ctx.status = err.status;
       ctx.body = { message: err.message };
@@ -57,9 +62,11 @@ router.post('/edit-video', async (ctx) => {
   const image = takeOneFile(
     (rawFiles as Record<string, unknown>).image,
   );
+  const mask = takeOneFile((rawFiles as Record<string, unknown>).mask);
 
   const videoPath = video && 'filepath' in video ? String(video.filepath) : '';
   const imagePath = image && 'filepath' in image ? String(image.filepath) : '';
+  const maskPath = mask && 'filepath' in mask ? String(mask.filepath) : '';
 
   if (!videoPath) {
     throw createError(400, '请上传视频文件 video');
@@ -68,18 +75,50 @@ router.post('/edit-video', async (ctx) => {
     throw createError(400, '请上传参考图 image');
   }
 
+  const maskPreset = parseMaskPresetField(body);
+  const maskWidthPct = parseOptionalPct(body, 'mask_width_pct');
+  const maskHeightPct = parseOptionalPct(body, 'mask_height_pct');
+  const maskMarginPct = parseOptionalPct(body, 'mask_margin_pct');
+
+  if (maskPath && maskPreset) {
+    throw createError(
+      400,
+      '请二选一：上传 mask 文件，或填写 mask_preset 自动生成（不要同时使用）',
+    );
+  }
+
   let vBuf: Buffer;
   let iBuf: Buffer;
+  let maskBuf: Buffer | undefined;
   try {
-    [vBuf, iBuf] = await Promise.all([
+    const parts = await Promise.all([
       readFile(videoPath),
       readFile(imagePath),
+      ...(maskPath ? [readFile(maskPath)] : []),
     ]);
+    vBuf = parts[0]!;
+    iBuf = parts[1]!;
+    if (maskPath) maskBuf = parts[2]!;
   } finally {
     await Promise.allSettled([
       unlink(videoPath).catch(() => {}),
       unlink(imagePath).catch(() => {}),
+      ...(maskPath ? [unlink(maskPath).catch(() => {})] : []),
     ]);
+  }
+
+  if (!maskBuf && maskPreset) {
+    try {
+      maskBuf = generateAutoMaskPng(vBuf, {
+        preset: maskPreset,
+        widthPct: maskWidthPct,
+        heightPct: maskHeightPct,
+        marginPct: maskMarginPct,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw createError(500, `自动生成 mask 失败: ${msg}`);
+    }
   }
 
   const stream = await processVideoWithWanx({
@@ -94,6 +133,17 @@ router.post('/edit-video', async (ctx) => {
       originalname: fileName(image, 'ref.png'),
       mimetype: fileMime(image, 'image/png'),
     },
+    ...(maskBuf !== undefined
+      ? {
+          mask: {
+            buffer: maskBuf,
+            originalname: mask
+              ? fileName(mask, 'mask.png')
+              : 'auto-mask.png',
+            mimetype: mask ? fileMime(mask, 'image/png') : 'image/png',
+          },
+        }
+      : {}),
   });
 
   ctx.set('Content-Type', 'video/mp4');
@@ -152,6 +202,36 @@ function fileMime(
   const m = f?.mimetype;
   if (typeof m === 'string' && m.length > 0) return m;
   return fallback;
+}
+
+function parseMaskPresetField(
+  body: Record<string, unknown>,
+): LogoMaskPreset | undefined {
+  const raw = body.mask_preset ?? body.maskPreset;
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return undefined;
+  }
+  const s = String(raw).trim().toLowerCase();
+  if (s === 'tl' || s === 'tr' || s === 'bl' || s === 'br') return s;
+  throw createError(400, 'mask_preset 须为 tl、tr、bl、br 之一');
+}
+
+function parseOptionalPct(
+  body: Record<string, unknown>,
+  key: string,
+): number | undefined {
+  const raw = body[key];
+  if (raw === undefined || raw === null || String(raw).trim() === '') {
+    return undefined;
+  }
+  const n = Number(raw);
+  if (Number.isNaN(n)) {
+    throw createError(400, `${key} 须为数字`);
+  }
+  if (n <= 0 || n > 100) {
+    throw createError(400, `${key} 须在 0 与 100 之间`);
+  }
+  return n;
 }
 
 app.use(router.routes());

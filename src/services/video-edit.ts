@@ -25,6 +25,8 @@ export async function processVideoWithWanx(
     prompt: string;
     video: UploadedPart;
     image: UploadedPart;
+    /** 与视频分辨率一致：白 [255,255,255]=编辑区，黑 [0,0,0]=保留。提供时走万相 `video_edit`，否则为整段 `video_repainting`。 */
+    mask?: UploadedPart;
   },
   deps?: { upload?: DashscopeUploader; wanx?: DashscopeWanx },
 ): Promise<ReadStream> {
@@ -33,10 +35,13 @@ export async function processVideoWithWanx(
 
   assertFfmpegAvailable();
 
-  const chunkSec = Math.max(
+  const envChunk = Math.max(
     1,
     Math.floor(Number(process.env.VIDEO_CHUNK_SECONDS ?? '8')),
   );
+  const useLocalEdit = Boolean(params.mask);
+  /** 局部编辑接口单段最多处理约 5 秒，超长会被截断，故与官方一致将切片上限压到 5。 */
+  const chunkSec = useLocalEdit ? Math.min(envChunk, 5) : envChunk;
 
   const workDir = mkdtempSync(join(tmpdir(), 'wanx-edit-'));
   const inputVideo = join(workDir, 'input.mp4');
@@ -56,6 +61,14 @@ export async function processVideoWithWanx(
       params.image.mimetype || 'image/png',
     );
 
+    const maskOss = params.mask
+      ? await dashUpload.uploadBuffer(
+          params.mask.buffer,
+          params.mask.originalname || 'mask.png',
+          params.mask.mimetype || 'image/png',
+        )
+      : undefined;
+
     const outputParts: string[] = [];
     for (let i = 0; i < segments.length; i++) {
       const segBuf = await fsp.readFile(segments[i]!);
@@ -64,11 +77,19 @@ export async function processVideoWithWanx(
         `part-${i}.mp4`,
         'video/mp4',
       );
-      const taskId = await wanx.createVideoRepaintingTask(
-        params.prompt,
-        videoOss,
-        imageOss,
-      );
+      const taskId =
+        useLocalEdit && maskOss
+          ? await wanx.createVideoEditTask(
+              params.prompt,
+              videoOss,
+              imageOss,
+              maskOss,
+            )
+          : await wanx.createVideoRepaintingTask(
+              params.prompt,
+              videoOss,
+              imageOss,
+            );
       const resultUrl = await wanx.waitForVideoUrl(taskId);
       const outPath = join(workDir, `out-${String(i).padStart(3, '0')}.mp4`);
       await downloadToFile(resultUrl, outPath);
